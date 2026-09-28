@@ -16,8 +16,10 @@
 #include <AMReX_PlotFileUtil.H>
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_MultiFabUtil.H>
+#include <AMReX_ParmParse.H>
 
 #include "chrono"
+#include <fstream>
 
 using namespace std::chrono;
 
@@ -551,6 +553,73 @@ void main_driver(const char* argv)
 
 #endif
 
+    ///////////////////////////////////////////
+    // Drop volume tracking (for equilibration diagnostics)
+    ///////////////////////////////////////////
+
+    // drop_vol_int   : compute/write drop volume every this many steps (<=0 disables)
+    // drop_vol_thresh: species-1 concentration threshold used to define "inside the drop"
+    // drop_vol_below : if 1, a cell counts as "inside the drop" when c1 <= drop_vol_thresh
+    //                  (use this when c_init_1, the value inside the drop, is the smaller one)
+    //                  if 0, a cell counts as "inside the drop" when c1 >= drop_vol_thresh
+    int drop_vol_int = 0;
+    Real drop_vol_thresh = 0.5;
+    int drop_vol_below = 0;
+    {
+        ParmParse pp;
+        pp.query("drop_vol_int",drop_vol_int);
+        pp.query("drop_vol_thresh",drop_vol_thresh);
+        pp.query("drop_vol_below",drop_vol_below);
+    }
+
+    std::ofstream drop_vol_str;
+    if (drop_vol_int > 0 && ParallelDescriptor::IOProcessor()) {
+        drop_vol_str.open("drop_volume.dat", restart < 0 ? std::ofstream::out : std::ofstream::app);
+        drop_vol_str.precision(17);
+        if (restart < 0) {
+            drop_vol_str << "# time  drop_volume  ncells_in_drop" << std::endl;
+        }
+    }
+
+    auto ComputeAndWriteDropVolume = [&] (const MultiFab& rho, const MultiFab& rhotot,
+                                          int istep_local, Real time_local)
+    {
+        Real cell_vol = (AMREX_SPACEDIM == 2) ? dx[0]*dx[1]*cell_depth : dx[0]*dx[1]*dx[2];
+
+        auto const& rho_ma    = rho.const_arrays();
+        auto const& rhotot_ma = rhotot.const_arrays();
+        Real thresh = drop_vol_thresh;
+        int below = drop_vol_below;
+
+        auto r = ParReduce(TypeMultiplier<TypeList,ReduceOpSum[2]>{},
+                           TypeMultiplier<TypeList,       Real[2]>{},
+                           rho,
+        [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k)
+                           -> GpuTuple<Real,Real>
+        {
+            auto const& rho_arr    = rho_ma[box_no];
+            auto const& rhotot_arr = rhotot_ma[box_no];
+            Real c1 = rho_arr(i,j,k,0) / rhotot_arr(i,j,k);
+            bool is_inside = below ? (c1 <= thresh) : (c1 >= thresh);
+            Real inside = is_inside ? 1. : 0.;
+            return {inside, inside};
+        });
+
+        Real ncells_in_drop = amrex::get<0>(r);
+        ParallelDescriptor::ReduceRealSum(ncells_in_drop);
+
+        Real drop_volume = ncells_in_drop * cell_vol;
+
+        if (ParallelDescriptor::IOProcessor()) {
+            drop_vol_str << time_local << " " << drop_volume << " " << ncells_in_drop << std::endl;
+        }
+    };
+
+    if (restart < 0 && drop_vol_int > 0) {
+        // include the initial condition in the time series
+        ComputeAndWriteDropVolume(rho_old, rhotot_old, 0, 0.);
+    }
+
     // Time stepping loop
     for(int istep=init_step; istep<=max_step; ++istep) {
 
@@ -749,6 +818,11 @@ void main_driver(const char* argv)
         amrex::Print() << "Advanced step " << istep << " in " << step_stop_time << " seconds\n";
 
         time = time + dt;
+
+        // track drop volume at specific intervals (for equilibration diagnostics)
+        if (drop_vol_int > 0 && istep%drop_vol_int == 0) {
+            ComputeAndWriteDropVolume(rho_new,rhotot_new,istep,time);
+        }
 
         // write plotfile at specific intervals
         if (plot_int > 0 && istep%plot_int == 0) {
